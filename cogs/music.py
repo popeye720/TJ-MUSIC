@@ -675,7 +675,7 @@ class Music(commands.Cog):
             if q.startswith("http://") or q.startswith("https://"):
                 results = await wavelink.Playable.search(q)
             else:
-                results = await wavelink.Playable.search(f"ytsearch:{q}")
+                results = await wavelink.Playable.search(f"ytmsearch:{q}")
                 
             playables: list[wavelink.Playable] = []
 
