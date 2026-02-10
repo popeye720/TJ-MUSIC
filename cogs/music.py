@@ -672,8 +672,8 @@ class Music(commands.Cog):
             if q.startswith("http://") or q.startswith("https://"):
                 results = await wavelink.Playable.search(q)
             else:
-                results = await wavelink.Playable.search(q, source=wavelink.TrackSource.YouTube)
-
+                results = await wavelink.Playable.search(f"ytsearch:{q}")
+                
             playables: list[wavelink.Playable] = []
 
             if results is None:
