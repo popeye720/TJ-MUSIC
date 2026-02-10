@@ -208,6 +208,9 @@ class Music(commands.Cog):
                 await wavelink.Pool.connect(nodes=[node], client=self.bot)
                 self._node_ready.set()
                 self.music_available = True
+                print(f"✅ Lavalink node connected → {uri}")
+                log.info(f"✅ Lavalink node connected → {uri}")
+
             except Exception:
                 self.music_available = False
                 log.exception("Lavalink node connect failed (will retry)")
