@@ -1,8 +1,7 @@
-import os
 import asyncio
+import os
 import time
-import logging
-from dataclasses import dataclass
+import traceback
 from typing import Optional
 
 import discord
@@ -10,13 +9,10 @@ from discord.ext import commands
 from discord import app_commands
 import wavelink
 
-
 # ✅ BRANDING (EXACT)
 BRAND_TITLE = "MUSIC PROVIDED BY TEJAS"
 BRAND_URL = "https://discord.gg/DVqvtsYNy7"
 EMBED_COLOR = discord.Color.from_rgb(2, 102, 255)
-
-log = logging.getLogger("musicbot.music")
 
 
 def format_duration_ms(ms: int | None) -> str:
@@ -32,10 +28,10 @@ def format_duration_ms(ms: int | None) -> str:
     return f"{m}m {s}s"
 
 
-@dataclass
 class Track:
-    playable: wavelink.Playable
-    requester_id: int
+    def __init__(self, playable: wavelink.Playable, requester_id: int):
+        self.playable = playable
+        self.requester_id = requester_id
 
     @property
     def title(self) -> str:
@@ -43,11 +39,7 @@ class Track:
 
     @property
     def author(self) -> str:
-        return (
-            getattr(self.playable, "author", None)
-            or getattr(self.playable, "artist", None)
-            or "Unknown"
-        )
+        return getattr(self.playable, "author", None) or getattr(self.playable, "artist", None) or "Unknown"
 
     @property
     def duration_ms(self) -> int | None:
@@ -59,14 +51,14 @@ class Track:
 
 
 class GuildMusicState:
-    def __init__(self) -> None:
+    def __init__(self):
         self.queue: asyncio.Queue[Track] = asyncio.Queue()
         self.current: Optional[Track] = None
 
         # ✅ loop current song
         self.loop_enabled: bool = False
 
-        # ✅ panel storage
+        # panel storage (single persistent panel per guild)
         self.panel_channel_id: Optional[int] = None
         self.panel_message_id: Optional[int] = None
 
@@ -76,11 +68,8 @@ class GuildMusicState:
         # ✅ 1-second global (per-guild) button cooldown
         self.cooldown_until: float = 0.0
 
-        # last /play channel (where we post queue ended / idle embeds)
+        # last /play channel for "queue ended" + idle leave embed
         self.last_play_text_channel_id: Optional[int] = None
-
-        # idle leave control
-        self.idle_leave_seconds: int = 120
 
 
 class MusicPanelView(discord.ui.View):
@@ -99,7 +88,10 @@ class MusicPanelView(discord.ui.View):
         # ✅ 1 second safety cooldown for everyone (per guild)
         now = time.monotonic()
         if now < st.cooldown_until:
-            await self.cog._safe_ephemeral(interaction, "⏳ Wait 1 second...")
+            try:
+                await interaction.response.send_message("⏳ Wait 1 second...", ephemeral=True)
+            except Exception:
+                pass
             return False
 
         player = self.cog.get_player(guild)
@@ -119,46 +111,32 @@ class MusicPanelView(discord.ui.View):
         return True
 
     @discord.ui.button(label="▶️ Play", style=discord.ButtonStyle.secondary, custom_id="music_play")
-    async def btn_play(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def btn_play(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog._btn_play(interaction)
 
     @discord.ui.button(label="⏸️ Pause", style=discord.ButtonStyle.secondary, custom_id="music_pause")
-    async def btn_pause(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog._btn_pause(interaction)
 
     @discord.ui.button(label="⏭️ Skip", style=discord.ButtonStyle.secondary, custom_id="music_skip")
-    async def btn_skip(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def btn_skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog._btn_skip(interaction)
 
     @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.secondary, custom_id="music_stop")
-    async def btn_stop(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog._btn_stop(interaction)
 
     @discord.ui.button(label="🔁 Loop", style=discord.ButtonStyle.secondary, custom_id="music_loop")
-    async def btn_loop(self, interaction: discord.Interaction, _: discord.ui.Button):
+    async def btn_loop(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog._btn_loop(interaction)
 
 
 class Music(commands.Cog):
-
-
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-
         self.states: dict[int, GuildMusicState] = {}
         self._voice_locks: dict[int, asyncio.Lock] = {}
-
         self._node_ready = asyncio.Event()
-        self._node_connecting = asyncio.Lock()
-        self.music_available: bool = True
-        self._node_retry_task: Optional[asyncio.Task] = None
-        self._retry_interval = 120
-        # ✅ persistent view registration (buttons remain functional on edited panel messages)
-        self.bot.add_view(MusicPanelView(self, guild_id=0), message_id=None)
-
-    def _reset_node_state(self):
-        self._node_ready.clear()
-        self.music_available = False
 
     # ---------- helpers ----------
     def _get_voice_lock(self, guild_id: int) -> asyncio.Lock:
@@ -188,63 +166,41 @@ class Music(commands.Cog):
         st = self.get_state(guild_id)
         st.cooldown_until = time.monotonic() + 1.0
 
-    async def _connect_node(self) -> None:
+    async def _connect_node(self):
         if self._node_ready.is_set():
             return
 
-        async with self._node_connecting:
-            if self._node_ready.is_set():
-                return
+        uri = (os.getenv("LAVALINK_URI") or "").strip().rstrip("/")
+        password = (os.getenv("LAVALINK_PASSWORD") or "").strip()
 
-            uri = (os.getenv("LAVALINK_URI") or "").strip().rstrip("/")
-            password = (os.getenv("LAVALINK_PASSWORD") or "").strip()
+        if not uri or not password:
+            print("⚠️ Music disabled: set LAVALINK_URI and LAVALINK_PASSWORD env vars to enable Lavalink.")
+            return
 
-            if not uri or not password:
-                self.music_available = False
-                return
-
-            try:
-                node = wavelink.Node(uri=uri, password=password)
-                await wavelink.Pool.connect(nodes=[node], client=self.bot)
-                self._node_ready.set()
-                self.music_available = True
-                print(f"✅ Lavalink node connected → {uri}")
-                log.info(f"✅ Lavalink node connected → {uri}")
-
-            except Exception:
-                self.music_available = False
-                log.exception("Lavalink node connect failed (will retry)")
-
-
-    async def _node_auto_recovery_loop(self):
-        while True:
-            await asyncio.sleep(self._retry_interval)
-            if self._node_ready.is_set():
-                continue
-            log.info("🔁 Trying Lavalink auto-recovery...")
-            self._reset_node_state()
-            try:
-                await self._connect_node()
-                if self._node_ready.is_set():
-                    log.info("✅ Lavalink auto-recovered successfully")
-            except Exception:
-                log.exception("Lavalink auto-recovery attempt failed")   
-
+        try:
+            node = wavelink.Node(uri=uri, password=password)
+            await wavelink.Pool.connect(nodes=[node], client=self.bot)
+            print("✅ Lavalink node connected:", uri)
+            self._node_ready.set()
+        except Exception as e:
+            print("❌ Lavalink node connect failed (music disabled):", e)
+            traceback.print_exc()
 
     async def ensure_voice(self, interaction: discord.Interaction) -> Optional[wavelink.Player]:
         guild = interaction.guild
         if not guild:
             return None
 
-        await self._connect_node()
         if not self._node_ready.is_set():
-            await self._safe_ephemeral(interaction, "⚠️ Music is currently disabled (Lavalink offline or not configured).")
+            await self._safe_ephemeral(interaction, "⚠️ Music is currently disabled (Lavalink offline / not configured).")
             return None
 
         member = interaction.user
         if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
             await self._safe_ephemeral(interaction, "You must be in a voice channel.")
             return None
+
+        await self._node_ready.wait()
 
         lock = self._get_voice_lock(guild.id)
         async with lock:
@@ -262,8 +218,10 @@ class Music(commands.Cog):
                 except Exception:
                     pass
                 return player
-            except Exception:
-                await self._safe_ephemeral(interaction, "Voice connect failed.")
+            except Exception as e:
+                await self._safe_ephemeral(interaction, f"Voice connect failed: {e}")
+                print("❌ Voice connect failed:", e)
+                traceback.print_exc()
                 return None
 
     async def _ensure_same_vc(self, interaction: discord.Interaction) -> bool:
@@ -288,50 +246,53 @@ class Music(commands.Cog):
         return True
 
     # ---------- embeds ----------
-    def _base_embed(self) -> discord.Embed:
+    def _base_embed(self, guild: discord.Guild) -> discord.Embed:
         return discord.Embed(title=BRAND_TITLE, url=BRAND_URL, color=EMBED_COLOR)
+
+    def build_idle_leave_embed(self, guild: discord.Guild) -> discord.Embed:
+        embed = self._base_embed(guild)
+        embed.description = (
+            "Leaving voice channel due to inactivity. "
+            "You can add songs again using /play command."
+        )
+        return embed
 
     def build_now_playing_embed(self, guild: discord.Guild) -> discord.Embed:
         st = self.get_state(guild.id)
-        embed = self._base_embed()
+        embed = self._base_embed(guild)
 
         t = st.current
         if not t:
             embed.description = "No track is playing."
-            embed.add_field(name="Loop", value="On" if st.loop_enabled else "Off", inline=True)
-            embed.add_field(name="Queue", value=f"{st.queue.qsize()} track(s)" if st.queue.qsize() else "(empty)", inline=True)
-            return embed
-
-        title_line = f"**[{t.title}]({t.uri or BRAND_URL})**"
-        embed.description = title_line
-
-        embed.add_field(name="Author", value=t.author or "Unknown", inline=True)
-        embed.add_field(name="Duration", value=format_duration_ms(t.duration_ms), inline=True)
-        embed.add_field(name="Requested By", value=f"<@{t.requester_id}>", inline=True)
+        else:
+            embed.description = f"**[{t.title}]({t.uri or BRAND_URL})**"
+            embed.add_field(name="Requested By", value=f"<@{t.requester_id}>", inline=True)
+            embed.add_field(name="Duration", value=format_duration_ms(t.duration_ms), inline=True)
+            embed.add_field(name="Author", value=t.author or "Unknown", inline=True)
 
         embed.add_field(name="Loop", value="On" if st.loop_enabled else "Off", inline=True)
-        embed.add_field(name="Queue", value=f"{st.queue.qsize()} track(s)" if st.queue.qsize() else "(empty)", inline=True)
+        embed.add_field(
+            name="Queue",
+            value=f"{st.queue.qsize()} track(s)" if not st.queue.empty() else "(empty)",
+            inline=True,
+        )
         return embed
 
-    def build_queue_ended_embed(self) -> discord.Embed:
-        embed = self._base_embed()
-        embed.description = "All songs have been played! You can add songs again using /play command."
-        return embed
-
-    def build_idle_leave_embed(self) -> discord.Embed:
-        embed = self._base_embed()
-        embed.description = "Leaving voice channel due to inactivity. You can add songs again using /play command."
+    def build_queue_ended_embed(self, guild: discord.Guild) -> discord.Embed:
+        embed = self._base_embed(guild)
+        embed.description = (
+            "All songs have been played! "
+            "You can add songs again using /play command."
+        )
         return embed
 
     async def get_panel_message(self, guild: discord.Guild) -> Optional[discord.Message]:
         st = self.get_state(guild.id)
         if not st.panel_channel_id or not st.panel_message_id:
             return None
-
         ch = guild.get_channel(st.panel_channel_id)
         if not isinstance(ch, discord.TextChannel):
             return None
-
         try:
             return await ch.fetch_message(st.panel_message_id)
         except Exception:
@@ -344,7 +305,7 @@ class Music(commands.Cog):
         *,
         embed: discord.Embed,
         view: Optional[discord.ui.View],
-    ) -> None:
+    ):
         st = self.get_state(guild.id)
 
         existing = await self.get_panel_message(guild)
@@ -352,40 +313,37 @@ class Music(commands.Cog):
             try:
                 await existing.edit(embed=embed, view=view)
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                print("❌ Panel edit failed:", e)
+                traceback.print_exc()
 
-        msg = await channel.send(embed=embed, view=view)
-        st.panel_channel_id = msg.channel.id
-        st.panel_message_id = msg.id
+        try:
+            msg = await channel.send(embed=embed, view=view)
+            st.panel_channel_id = msg.channel.id
+            st.panel_message_id = msg.id
+        except Exception as e:
+            print("❌ Panel send failed:", e)
+            traceback.print_exc()
 
-    async def refresh_panel(self, guild: discord.Guild, *, keep_buttons: bool = True) -> None:
+    async def refresh_panel(self, guild: discord.Guild, *, keep_buttons: bool = True):
         msg = await self.get_panel_message(guild)
         if not msg:
             return
         try:
             view = MusicPanelView(self, guild.id) if keep_buttons else None
             await msg.edit(embed=self.build_now_playing_embed(guild), view=view)
-        except Exception:
-            pass
+        except Exception as e:
+            print("❌ Panel refresh failed:", e)
+            traceback.print_exc()
 
-    async def _send_to_last_play_channel(self, guild: discord.Guild, embed: discord.Embed) -> None:
-        st = self.get_state(guild.id)
-        ch = guild.get_channel(st.last_play_text_channel_id) if st.last_play_text_channel_id else None
-        if isinstance(ch, discord.TextChannel):
-            try:
-                await ch.send(embed=embed)
-            except Exception:
-                pass
-
-    def _ensure_player_loop_running(self, guild: discord.Guild, player: wavelink.Player) -> None:
+    def _ensure_player_loop_running(self, guild: discord.Guild, player: wavelink.Player):
+        """If bot is connected but idle, ensure player_loop task is running (prevents VC idle /play no sound)."""
         st = self.get_state(guild.id)
 
         if (not st.player_task) or st.player_task.done():
             st.player_task = self.bot.loop.create_task(self.player_loop(guild.id))
             return
 
-        # If task exists but we're idle with no current and not playing/paused, restart for safety.
         if st.current is None and not getattr(player, "playing", False) and not getattr(player, "paused", False):
             try:
                 st.player_task.cancel()
@@ -393,7 +351,7 @@ class Music(commands.Cog):
                 pass
             st.player_task = self.bot.loop.create_task(self.player_loop(guild.id))
 
-    async def player_loop(self, guild_id: int) -> None:
+    async def player_loop(self, guild_id: int):
         st = self.get_state(guild_id)
         guild = self.bot.get_guild(guild_id)
         if not guild:
@@ -402,7 +360,6 @@ class Music(commands.Cog):
         while True:
             player = self.get_player(guild)
             if not player or not getattr(player, "connected", False):
-                st.current = None
                 return
 
             if st.stopped:
@@ -438,9 +395,11 @@ class Music(commands.Cog):
                 st.current = track
                 try:
                     await player.play(track.playable)
-                except Exception:
+                except Exception as e:
+                    print("❌ player.play failed:", e)
+                    traceback.print_exc()
                     st.current = None
-                    # If this track fails, try next immediately
+
                     if not st.queue.empty():
                         try:
                             track = st.queue.get_nowait()
@@ -450,7 +409,11 @@ class Music(commands.Cog):
                     break
 
                 await asyncio.sleep(0.25)
-                await self.refresh_panel(guild, keep_buttons=True)
+
+                try:
+                    await self.refresh_panel(guild, keep_buttons=True)
+                except Exception:
+                    pass
 
                 while getattr(player, "playing", False) or getattr(player, "paused", False):
                     if st.stopped:
@@ -471,27 +434,24 @@ class Music(commands.Cog):
                 st.current = None
                 break
 
-            # Queue ended & not looping
             if st.queue.empty() and not st.stopped and not st.loop_enabled:
                 msg = await self.get_panel_message(guild)
                 if msg:
                     try:
-                        await msg.edit(embed=self.build_queue_ended_embed(), view=None)
+                        await msg.edit(embed=self.build_queue_ended_embed(guild), view=None)
                     except Exception:
                         pass
 
-                # Idle timeout before leaving
-                await asyncio.sleep(st.idle_leave_seconds)
-
-                player = self.get_player(guild)
-                if not player or not getattr(player, "connected", False):
-                    st.current = None
-                    return
-
+                await asyncio.sleep(120)
                 if not st.queue.empty() or getattr(player, "playing", False) or getattr(player, "paused", False):
                     continue
 
-                await self._send_to_last_play_channel(guild, self.build_idle_leave_embed())
+                ch = guild.get_channel(st.last_play_text_channel_id) if st.last_play_text_channel_id else None
+                if isinstance(ch, discord.TextChannel):
+                    try:
+                        await ch.send(embed=self.build_idle_leave_embed(guild))
+                    except Exception:
+                        pass
 
                 try:
                     await player.disconnect()
@@ -499,12 +459,10 @@ class Music(commands.Cog):
                     pass
 
                 st.current = None
-                st.panel_channel_id = None
-                st.panel_message_id = None
                 return
 
     # ---------- buttons ----------
-    async def _btn_play(self, interaction: discord.Interaction) -> None:
+    async def _btn_play(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if not guild:
@@ -530,7 +488,7 @@ class Music(commands.Cog):
 
         await self.refresh_panel(guild, keep_buttons=True)
 
-    async def _btn_pause(self, interaction: discord.Interaction) -> None:
+    async def _btn_pause(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if not guild:
@@ -556,7 +514,7 @@ class Music(commands.Cog):
 
         await self.refresh_panel(guild, keep_buttons=True)
 
-    async def _btn_skip(self, interaction: discord.Interaction) -> None:
+    async def _btn_skip(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if not guild:
@@ -584,13 +542,13 @@ class Music(commands.Cog):
             msg = await self.get_panel_message(guild)
             if msg:
                 try:
-                    await msg.edit(embed=self.build_queue_ended_embed(), view=None)
+                    await msg.edit(embed=self.build_queue_ended_embed(guild), view=None)
                 except Exception:
                     pass
         else:
             await self.refresh_panel(guild, keep_buttons=True)
 
-    async def _btn_stop(self, interaction: discord.Interaction) -> None:
+    async def _btn_stop(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if not guild:
@@ -623,7 +581,7 @@ class Music(commands.Cog):
         msg = await self.get_panel_message(guild)
         if msg:
             try:
-                await msg.edit(embed=self.build_queue_ended_embed(), view=None)
+                await msg.edit(embed=self.build_queue_ended_embed(guild), view=None)
             except Exception:
                 pass
 
@@ -632,7 +590,7 @@ class Music(commands.Cog):
 
         await interaction.followup.send("⏹️ Stopped.", ephemeral=True)
 
-    async def _btn_loop(self, interaction: discord.Interaction) -> None:
+    async def _btn_loop(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
         if not guild:
@@ -659,33 +617,23 @@ class Music(commands.Cog):
 
         player = await self.ensure_voice(interaction)
         if not player:
-            if not self.music_available:
-                return await interaction.edit_original_response(content="🛠️ **Music system is currently under maintenance.**\nPlease try again later.")
-            return await interaction.edit_original_response(content="Music unavailable.")
+            return await interaction.edit_original_response(content="Voice connect failed.")
 
         st = self.get_state(guild.id)
         if isinstance(interaction.channel, discord.TextChannel):
             st.last_play_text_channel_id = interaction.channel.id
 
-        q = (query or "").strip()
-        if not q:
-            return await interaction.edit_original_response(content="Provide a song name or URL.")
-
         try:
-            if q.startswith("http://") or q.startswith("https://"):
-                results = await wavelink.Playable.search(q)
+            if query.startswith("http://") or query.startswith("https://"):
+                results = await wavelink.Playable.search(query)
             else:
-                results = await wavelink.Playable.search(f"ytmsearch:{q}")
-                
-            playables: list[wavelink.Playable] = []
+                results = await wavelink.Playable.search(query, source=wavelink.TrackSource.YouTube)
 
+            playables: list[wavelink.Playable] = []
             if results is None:
                 playables = []
             elif isinstance(results, wavelink.Playlist):
                 playables = list(results)
-                # safety cap for extremely large playlists
-                if len(playables) > 200:
-                    playables = playables[:200]
             elif isinstance(results, (list, tuple)):
                 playables = list(results[:1])
             else:
@@ -699,10 +647,8 @@ class Music(commands.Cog):
             if st.stopped:
                 st.stopped = False
 
-            added = 0
             for p in playables:
                 await st.queue.put(Track(playable=p, requester_id=interaction.user.id))
-                added += 1
 
             self._ensure_player_loop_running(guild, player)
             await asyncio.sleep(0.15)
@@ -715,12 +661,17 @@ class Music(commands.Cog):
                     view=MusicPanelView(self, guild.id),
                 )
 
-            await interaction.edit_original_response(content=f"Queued: {added} track(s).")
-            await self.refresh_panel(guild, keep_buttons=True)
+            await interaction.edit_original_response(content=f"Queued: {st.queue.qsize()} track(s).")
 
-        except Exception:
-            log.exception("/play failed")
-            await interaction.edit_original_response(content="Play failed.")
+            try:
+                await self.refresh_panel(guild, keep_buttons=True)
+            except Exception:
+                pass
+
+        except Exception as e:
+            print("❌ /play failed:", e)
+            traceback.print_exc()
+            await interaction.edit_original_response(content=f"Play failed: {e}")
 
     @app_commands.command(name="stop", description="Stop playback and clear queue (same VC only)")
     @app_commands.guild_only()
@@ -730,36 +681,14 @@ class Music(commands.Cog):
         await self._btn_stop(interaction)
 
     # ---------- events ----------
-@commands.Cog.listener()
-async def on_ready(self):
-    await self._connect_node()
-
-    # 🔥 CLEAN OLD PANELS ON BOT RESTART
-    for guild_id, st in list(self.states.items()):
-        guild = self.bot.get_guild(guild_id)
-        if not guild:
-            continue
-
-        if st.panel_channel_id and st.panel_message_id:
-            channel = guild.get_channel(st.panel_channel_id)
-            if isinstance(channel, discord.TextChannel):
-                try:
-                    msg = await channel.fetch_message(st.panel_message_id)
-                    # Option A: delete old panel completely
-                    await msg.delete()
-                except Exception:
-                    pass
-
-            # reset stored panel refs
-            st.panel_channel_id = None
-            st.panel_message_id = None
-
-    # auto-recovery loop
-    if not self._node_retry_task or self._node_retry_task.done():
-        self._node_retry_task = self.bot.loop.create_task(
-            self._node_auto_recovery_loop()
-        )
-
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if not self._node_ready.is_set():
+            try:
+                await self._connect_node()
+            except Exception as e:
+                print("❌ Lavalink node connect failed:", e)
+                traceback.print_exc()
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild):
