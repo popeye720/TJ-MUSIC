@@ -176,15 +176,18 @@ class Music(commands.Cog):
         if not uri or not password:
             print("⚠️ Music disabled: set LAVALINK_URI and LAVALINK_PASSWORD env vars to enable Lavalink.")
             return
-
+        
+        if uri.startswith("https://"):
+            uri = uri.replace("https://", "http://")
         try:
             node = wavelink.Node(uri=uri, password=password)
             await wavelink.Pool.connect(nodes=[node], client=self.bot)
             print("✅ Lavalink node connected:", uri)
             self._node_ready.set()
         except Exception as e:
-            print("❌ Lavalink node connect failed (music disabled):", e)
+            print("❌ Lavalink node connect failed:", e)
             traceback.print_exc()
+
 
     async def ensure_voice(self, interaction: discord.Interaction) -> Optional[wavelink.Player]:
         guild = interaction.guild
@@ -265,17 +268,23 @@ class Music(commands.Cog):
         if not t:
             embed.description = "No track is playing."
         else:
-            embed.description = f"**[{t.title}]({t.uri or BRAND_URL})**"
+            #embed.description = f"**[{t.title}]({t.uri or BRAND_URL})**"
+            embed.description = f"**{t.title}**"
             embed.add_field(name="Requested By", value=f"<@{t.requester_id}>", inline=True)
             embed.add_field(name="Duration", value=format_duration_ms(t.duration_ms), inline=True)
             embed.add_field(name="Author", value=t.author or "Unknown", inline=True)
 
-        embed.add_field(name="Loop", value="On" if st.loop_enabled else "Off", inline=True)
-        embed.add_field(
+            
+#------------------------------
+        #embed.add_field(name="Loop", value="On" if st.loop_enabled else "Off", inline=True)
+        #embed.add_field(
             name="Queue",
             value=f"{st.queue.qsize()} track(s)" if not st.queue.empty() else "(empty)",
             inline=True,
-        )
+        #)
+
+#--------------------------
+
         return embed
 
     def build_queue_ended_embed(self, guild: discord.Guild) -> discord.Embed:
@@ -624,10 +633,12 @@ class Music(commands.Cog):
             st.last_play_text_channel_id = interaction.channel.id
 
         try:
-            if query.startswith("http://") or query.startswith("https://"):
+            if query.startswith(("http://", "https://")):
                 results = await wavelink.Playable.search(query)
             else:
-                results = await wavelink.Playable.search(query, source=wavelink.TrackSource.YouTube)
+                results = await wavelink.Playable.search(query)
+
+
 
             playables: list[wavelink.Playable] = []
             if results is None:
@@ -641,7 +652,7 @@ class Music(commands.Cog):
 
             if not playables:
                 return await interaction.edit_original_response(
-                    content="No tracks found. (Make sure Lavalink YouTube plugin is enabled.)"
+                    content="No tracks found."
                 )
 
             if st.stopped:
@@ -661,7 +672,7 @@ class Music(commands.Cog):
                     view=MusicPanelView(self, guild.id),
                 )
 
-            await interaction.edit_original_response(content=f"Queued: {st.queue.qsize()} track(s).")
+            await interaction.edit_original_response(content=f"Queued {len(playables)} track(s).")
 
             try:
                 await self.refresh_panel(guild, keep_buttons=True)
