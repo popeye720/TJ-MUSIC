@@ -177,8 +177,6 @@ class Music(commands.Cog):
             print("⚠️ Music disabled: set LAVALINK_URI and LAVALINK_PASSWORD env vars to enable Lavalink.")
             return
         
-        if uri.startswith("https://"):
-            uri = uri.replace("https://", "http://")
         try:
             node = wavelink.Node(uri=uri, password=password)
             await wavelink.Pool.connect(nodes=[node], client=self.bot)
